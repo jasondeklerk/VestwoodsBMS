@@ -18,6 +18,8 @@ class VestwoodsBMSConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         data_schema = vol.Schema({
             vol.Required("mac_address"): str,
             vol.Required("refresh_interval", default=30): int,
+            vol.Optional("number_of_cells", default=16): int,
+            vol.Optional("number_of_temperature_sensors", default=4): int,
         })
 
         return self.async_show_form(

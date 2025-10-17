@@ -289,9 +289,17 @@ class VestwoodsBMSClient:
             if parsed_data:
                 self._LOGGER.info("--- Parsed BMS Data ---")
                 for key, value in parsed_data.items():
-                    self._LOGGER.info(f"{key}: {value}")
-                    topic = f"{self.mqtt_topic_prefix}/{key}"
-                    self.mqtt_client.publish(topic, json.dumps(value), qos=0, retain=False)
+                    if key == 'cellVoltages':
+                        for i, voltage in enumerate(value):
+                            topic = f"{self.mqtt_topic_prefix}/cellVoltage_{i+1}"
+                            self.mqtt_client.publish(topic, json.dumps(voltage), qos=0, retain=False)
+                    elif key == 'cellTemperatures':
+                        for i, temp in enumerate(value):
+                            topic = f"{self.mqtt_topic_prefix}/cellTemperature_{i+1}"
+                            self.mqtt_client.publish(topic, json.dumps(temp), qos=0, retain=False)
+                    else:
+                        topic = f"{self.mqtt_topic_prefix}/{key}"
+                        self.mqtt_client.publish(topic, json.dumps(value), qos=0, retain=False)
             else:
                 self._LOGGER.warning("Failed to parse BMS data.")
             self.notification_data = bytearray() # Clear for next reading
