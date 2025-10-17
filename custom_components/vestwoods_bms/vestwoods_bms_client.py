@@ -1,0 +1,329 @@
+import asyncio
+import logging
+import struct
+import time
+from bleak import BleakClient, BleakScanner
+from bleak.exc import BleakError
+import paho.mqtt.client as mqtt
+import json
+
+_LOGGER = logging.getLogger(__name__)
+
+# Vestwoods BMS BLE UUIDs (Nordic UART Service)
+SERVICE_UUID = "6e400000-b5a3-f393-e0a9-e50e24dcca9e"
+# SWAPPED ROLES based on characteristic discovery:
+TX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # Write to this characteristic (was RX)
+RX_CHAR_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"  # Read/Notify from this characteristic (was TX)
+
+# Polling command for Vestwoods BMS (from batVestwoods.cpp)
+POLL_COMMAND = bytearray([0x7a, 0x00, 0x05, 0x00, 0x00, 0x01, 0x0c, 0xe5, 0xa7])
+
+def calc_crc(data: bytearray) -> int:
+    """Calculates the CRC16 for the given data, matching the C++ implementation."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001  # Equivalent to 40961 in decimal
+            else:
+                crc >>= 1
+    return crc & 0xFFFF
+
+def parse_response(data: bytearray) -> dict:
+    """Parses the BMS response data (command 0x0001)"""
+    if not data or len(data) < 8:
+        _LOGGER.warning("Response too short to be valid.")
+        return {}
+
+    # Validate start and end sentinels
+    if data[0] != 0x7a or data[-1] != 0xa7:
+        _LOGGER.warning(f"Invalid sentinels: Start={hex(data[0])}, End={hex(data[-1])}")
+        return {}
+
+    # Validate length
+    payload_len = data[2]
+    if len(data) != payload_len + 4:
+        _LOGGER.warning(f"Invalid length: Expected {payload_len + 4}, Got {len(data)}")
+        return {}
+
+    # Validate CRC
+    data_for_crc = data[1 : len(data) - 3] # Exclude start, CRC (2 bytes), End (1 byte)
+    calculated_crc = calc_crc(data_for_crc)
+
+    msg_crc_bytes = data[len(data) - 3 : len(data) - 1]
+    msg_crc = struct.unpack('>H', msg_crc_bytes)[0]
+
+    if msg_crc != calculated_crc:
+        _LOGGER.warning(f"CRC mismatch: Message CRC={hex(msg_crc)}, Calculated CRC={hex(calculated_crc)}")
+        return {}
+
+    # Parse payload (starting from byte 4: after 0x7a, unknown, length, unknown)
+    offset = 4 
+    command_received = struct.unpack('>H', data[4:6])[0]
+    if command_received != 0x0001:
+        _LOGGER.warning(f"Unexpected command received: {hex(command_received)}")
+        return {}
+    
+    offset = 6 # Start of actual data fields after command
+    
+    result = {}
+
+    # 0 - onlineStatus
+    result['onlineStatus'] = data[offset]
+    offset += 1
+
+    # 1 - batteriesSeriesNumber
+    num_cells = data[offset]
+    result['batteriesSeriesNumber'] = num_cells
+    offset += 1
+
+    result['cellVoltages'] = []
+    for j in range(num_cells):
+        # 2, 3 - cellVoltage (mV)
+        cell_voltage_raw = struct.unpack('>H', data[offset : offset + 2])[0] & 0x7fff
+        result['cellVoltages'].append(round(cell_voltage_raw / 1000.0, 3))
+        offset += 2
+    
+    # 4 - maxCellNumber
+    result['maxCellNumber'] = data[offset]
+    offset += 1
+
+    # 5,6 - maxCellVoltage
+    result['maxCellVoltage'] = round(struct.unpack('>H', data[offset : offset + 2])[0] / 1000.0, 3)
+    offset += 2
+
+    # 7 - minCellNumber
+    result['minCellNumber'] = data[offset]
+    offset += 1
+
+    # 8,9 - minCellVoltage
+    result['minCellVoltage'] = round(struct.unpack('>H', data[offset : offset + 2])[0] / 1000.0, 3)
+    offset += 2
+
+    # 10,11 - totalCurrent ( x / 100 - 300 )
+    total_current_raw = struct.unpack('>H', data[offset : offset + 2])[0]
+    result['totalCurrent'] = round((total_current_raw / 100.0) - 300.0, 2)
+    offset += 2
+
+    # 12, 13 - soc (x / 100)
+    result['soc'] = round(struct.unpack('>H', data[offset : offset + 2])[0] / 100.0, 2)
+    offset += 2
+
+    # 14, 15 - soh (x / 100)
+    result['soh'] = round(struct.unpack('>H', data[offset : offset + 2])[0] / 100.0, 2)
+    offset += 2
+
+    # 16, 17 - actualCapacity (x / 100)
+    result['actualCapacity'] = round(struct.unpack('>H', data[offset : offset + 2])[0] / 100.0, 2)
+    offset += 2
+
+    # 18, 19 - surplusCapacity (x / 100)
+    result['surplusCapacity'] = round(struct.unpack('>H', data[offset : offset + 2])[0] / 100.0, 2)
+    offset += 2
+
+    # 20, 21 - nominalCapacity (x / 100)
+    result['nominalCapacity'] = round(struct.unpack('>H', data[offset : offset + 2])[0] / 100.0, 2)
+    offset += 2
+
+    # 22 - batteriesTemperatureNumber
+    temp_count = data[offset]
+    result['batteriesTemperatureNumber'] = temp_count
+    offset += 1
+
+    result['cellTemperatures'] = []
+    for j in range(temp_count):
+        # 23, 24 - cellTemperature (x - 50)
+        result['cellTemperatures'].append(struct.unpack('>H', data[offset : offset + 2])[0] - 50)
+        offset += 2
+    
+    # 25, 26 - environmentalTemperature
+    result['environmentalTemperature'] = struct.unpack('>H', data[offset : offset + 2])[0] - 50
+    offset += 2
+
+    # 25, 26 - pcbTemperature
+    result['pcbTemperature'] = struct.unpack('>H', data[offset : offset + 2])[0] - 50
+    offset += 2
+
+    # 27 - maxTemperatureCellNumber
+    result['maxTemperatureCellNumber'] = data[offset]
+    offset += 1
+
+    # 28 - maxTemperatureCellValue
+    result['maxTemperatureCellValue'] = data[offset] - 50
+    offset += 1
+
+    # 29 - minTemperatureCellNumber
+    result['minTemperatureCellNumber'] = data[offset]
+    offset += 1
+
+    # 30 - minTemperatureCellValue
+    result['minTemperatureCellValue'] = data[offset] - 50
+    offset += 1
+
+    # 31 bmsFault1
+    result['bmsFault1'] = hex(data[offset])
+    offset += 1
+
+    # 32 bmsFault2
+    result['bmsFault2'] = hex(data[offset])
+    offset += 1
+
+    # 33 bmsAlert1
+    result['bmsAlert1'] = hex(data[offset])
+    offset += 1
+
+    # 34 bmsAlert2
+    result['bmsAlert2'] = hex(data[offset])
+    offset += 1
+
+    # 35 bmsAlert3
+    result['bmsAlert3'] = hex(data[offset])
+    offset += 1
+
+    # 36 bmsAlert4
+    result['bmsAlert4'] = hex(data[offset])
+    offset += 1
+
+    # 37, 38 u.cycleIndex
+    result['cycleIndex'] = struct.unpack('>H', data[offset : offset + 2])[0]
+    offset += 2
+
+    # 39, 40 totalVoltage ( x / 100)
+    result['totalVoltage'] = round(struct.unpack('>H', data[offset : offset + 2])[0] / 100.0, 2)
+    offset += 2
+
+    # 41 bmsStatus
+    result['bmsStatus'] = hex(data[offset])
+    offset += 1
+    
+    return result
+
+
+class VestwoodsBMSClient:
+    def __init__(
+        self,
+        mac_address: str,
+        mqtt_client: mqtt.Client,
+        mqtt_topic_prefix: str,
+        logger: logging.Logger = _LOGGER,
+    ):
+        self.mac_address = mac_address.upper()
+        self.mqtt_client = mqtt_client
+        self.mqtt_topic_prefix = mqtt_topic_prefix
+        self._LOGGER = logger
+        self.notification_data = bytearray()
+        self.notification_event = asyncio.Event()
+        self.client = None
+
+    def _notification_handler(self, sender, data):
+        """Simple notification handler which accumulates data."""
+        self.notification_data.extend(data)
+        # A simple heuristic to determine if a full message has been received:
+        # Check for start (0x7a) and end (0xa7) sentinels.
+        # This might need refinement based on actual message patterns.
+        if self.notification_data.startswith(b'\x7a') and self.notification_data.endswith(b'\xa7'):
+            self.notification_event.set() # Signal that a potential full message is ready
+        elif b'\xa7' in self.notification_data: # If an end sentinel is found, assume message is complete
+            self.notification_event.set() 
+
+    async def connect(self):
+        self._LOGGER.info(f"Searching for device {self.mac_address}...")
+        device = await BleakScanner.find_device_by_address(self.mac_address, timeout=20.0)
+
+        if not device:
+            self._LOGGER.warning(f"Could not find device with address {self.mac_address}")
+            return False
+
+        self._LOGGER.info(f"Found device: {device.name} ({device.address})")
+
+        self.client = BleakClient(device)
+        try:
+            await self.client.connect()
+            if self.client.is_connected:
+                self._LOGGER.info(f"Connected to {device.name} ({device.address})")
+                return True
+            else:
+                self._LOGGER.warning(f"Failed to connect to {device.address}")
+                return False
+        except BleakError as e:
+            self._LOGGER.error(f"Bleak error on connect: {e}")
+            return False
+
+    async def disconnect(self):
+        if self.client and self.client.is_connected:
+            await self.client.disconnect()
+            self._LOGGER.info(f"Disconnected from {self.mac_address}")
+
+    async def read_and_publish_data(self):
+        if not self.client or not self.client.is_connected:
+            self._LOGGER.warning("Not connected to BMS. Skipping data read.")
+            return
+
+        try:
+            # Enable notifications on the correct RX characteristic
+            await self.client.start_notify(RX_CHAR_UUID, self._notification_handler)
+            self._LOGGER.debug(f"Enabled notifications on {RX_CHAR_UUID}")
+            notifications_enabled = True
+        except BleakError as e:
+            self._LOGGER.error(f"Could not enable notifications on {RX_CHAR_UUID}: {e}")
+            notifications_enabled = False
+            self._LOGGER.warning("Cannot proceed without notifications on the RX characteristic.")
+            return # Exit if notifications cannot be enabled
+
+        # Send the polling command to the correct TX characteristic
+        self._LOGGER.debug(f"Sending poll command: {POLL_COMMAND.hex()} to {TX_CHAR_UUID}")
+        await self.client.write_gatt_char(TX_CHAR_UUID, POLL_COMMAND, response=False)
+        self._LOGGER.debug("Poll command sent.")
+
+        if notifications_enabled:
+            self._LOGGER.debug("Waiting for response via notifications...")
+            try:
+                await asyncio.wait_for(self.notification_event.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                self._LOGGER.warning("Timeout waiting for BMS response via notifications.")
+        
+        if self.notification_data:
+            self._LOGGER.debug(f"Received raw data: {self.notification_data.hex()}")
+            parsed_data = parse_response(self.notification_data)
+            if parsed_data:
+                self._LOGGER.info("--- Parsed BMS Data ---")
+                for key, value in parsed_data.items():
+                    self._LOGGER.info(f"{key}: {value}")
+                    topic = f"{self.mqtt_topic_prefix}/{key}"
+                    self.mqtt_client.publish(topic, json.dumps(value), qos=0, retain=False)
+            else:
+                self._LOGGER.warning("Failed to parse BMS data.")
+            self.notification_data = bytearray() # Clear for next reading
+            self.notification_event.clear() # Clear event for next reading
+        else:
+            self._LOGGER.warning("No data received from BMS after all attempts.")
+
+        if notifications_enabled:
+            await self.client.stop_notify(RX_CHAR_UUID)
+            self._LOGGER.debug("Notifications stopped.")
+
+    async def run(self, refresh_interval: int = 30):
+        while True:
+            try:
+                if not self.client or not self.client.is_connected:
+                    self._LOGGER.info("Attempting to connect to BMS...")
+                    if await self.connect():
+                        self._LOGGER.info("Successfully connected to BMS.")
+                    else:
+                        self._LOGGER.error("Failed to connect to BMS. Retrying in 5 seconds...")
+                        await asyncio.sleep(5)
+                        continue
+
+                await self.read_and_publish_data()
+
+            except BleakError as e:
+                self._LOGGER.error(f"BLE error during run: {e}. Attempting to reconnect in 5 seconds...")
+                await self.disconnect()
+                await asyncio.sleep(5)
+            except Exception as e:
+                self._LOGGER.error(f"An unexpected error occurred: {e}. Retrying in 5 seconds...")
+                await self.disconnect()
+                await asyncio.sleep(5)
+            finally:
+                await asyncio.sleep(refresh_interval)
