@@ -1,3 +1,4 @@
+#hacs integration
 import asyncio
 import logging
 import struct
