@@ -224,9 +224,7 @@ class VestwoodsBMSClient:
         # Check for start (0x7a) and end (0xa7) sentinels.
         # This might need refinement based on actual message patterns.
         if self.notification_data.startswith(b'\x7a') and self.notification_data.endswith(b'\xa7'):
-            self.notification_event.set() # Signal that a potential full message is ready
-        elif b'\xa7' in self.notification_data: # If an end sentinel is found, assume message is complete
-            self.notification_event.set() 
+            self.notification_event.set() # Signal that a potential full message is ready 
 
     async def connect(self):
         self._LOGGER.info(f"Searching for device {self.mac_address}...")
