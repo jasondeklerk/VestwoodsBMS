@@ -84,5 +84,3 @@ Once configured, the following sensors will be available in Home Assistant:
 *   **No sensor data**: 
     *   Verify your MQTT integration is working correctly.
     *   Check Home Assistant logs for any errors from the "Vestwoods BMS" integration.
-
-#
