@@ -5,7 +5,7 @@ import struct
 import time
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
-import paho.mqtt.client as mqtt
+from homeassistant.components import mqtt
 import json
 
 _LOGGER = logging.getLogger(__name__)
@@ -205,12 +205,12 @@ class VestwoodsBMSClient:
     def __init__(
         self,
         mac_address: str,
-        mqtt_client: mqtt.Client,
+        hass,
         mqtt_topic_prefix: str,
         logger: logging.Logger = _LOGGER,
     ):
         self.mac_address = mac_address.upper()
-        self.mqtt_client = mqtt_client
+        self.hass = hass
         self.mqtt_topic_prefix = mqtt_topic_prefix
         self._LOGGER = logger
         self.notification_data = bytearray()
@@ -293,14 +293,14 @@ class VestwoodsBMSClient:
                     if key == 'cellVoltages':
                         for i, voltage in enumerate(value):
                             topic = f"{self.mqtt_topic_prefix}/cellVoltage_{i+1}"
-                            self.mqtt_client.publish(topic, json.dumps(voltage), qos=0, retain=False)
+                            await mqtt.async_publish(self.hass, topic, json.dumps(voltage), qos=0, retain=False)
                     elif key == 'cellTemperatures':
                         for i, temp in enumerate(value):
                             topic = f"{self.mqtt_topic_prefix}/cellTemperature_{i+1}"
-                            self.mqtt_client.publish(topic, json.dumps(temp), qos=0, retain=False)
+                            await mqtt.async_publish(self.hass, topic, json.dumps(temp), qos=0, retain=False)
                     else:
                         topic = f"{self.mqtt_topic_prefix}/{key}"
-                        self.mqtt_client.publish(topic, json.dumps(value), qos=0, retain=False)
+                        await mqtt.async_publish(self.hass, topic, json.dumps(value), qos=0, retain=False)
             else:
                 self._LOGGER.warning("Failed to parse BMS data.")
             self.notification_data = bytearray() # Clear for next reading

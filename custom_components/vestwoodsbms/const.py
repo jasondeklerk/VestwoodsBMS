@@ -1,2 +1,2 @@
-DOMAIN = "vestwoods_bms"
-MQTT_TOPIC_PREFIX = "vestwoods_bms"
+DOMAIN = "vestwoodsbms"
+MQTT_TOPIC_PREFIX = "vestwoodsbms"

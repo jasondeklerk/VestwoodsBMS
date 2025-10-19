@@ -1,11 +1,11 @@
 {
-  "domain": "vestwoods_bms",
+  "domain": "vestwoodsbms",
   "name": "Vestwoods BMS",
   "documentation": "https://github.com/jasondeklerk/VestwoodsBMS",
   "issue_tracker": "https://github.com/jasondeklerk/VestwoodsBMS/issues",
-  "dependencies": [],
+  "dependencies": ["mqtt"],
   "codeowners": ["@jasondeklerk"],
-  "requirements": ["Bleak==0.21.1", "paho-mqtt==1.6.1"],
+  "requirements": ["Bleak"],
   "version": "1.0.0",
   "config_flow": true
 }
