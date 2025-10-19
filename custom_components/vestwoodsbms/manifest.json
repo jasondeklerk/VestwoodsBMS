@@ -5,7 +5,7 @@
   "issue_tracker": "https://github.com/jasondeklerk/VestwoodsBMS/issues",
   "dependencies": ["mqtt"],
   "codeowners": ["@jasondeklerk"],
-  "requirements": ["Bleak"],
+  "requirements": ["Bleak", "bleak-retry-connector"],
   "version": "1.0.0",
   "config_flow": true
 }

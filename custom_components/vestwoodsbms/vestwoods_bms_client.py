@@ -5,6 +5,7 @@ import struct
 import time
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
+from bleak_retry_connector import establish_connection
 from homeassistant.components import mqtt
 import json
 
@@ -214,17 +215,12 @@ class VestwoodsBMSClient:
         self.mqtt_topic_prefix = mqtt_topic_prefix
         self._LOGGER = logger
         self.notification_data = bytearray()
-        self.notification_event = asyncio.Event()
         self.client = None
+        self._is_connected = False
 
-    def _notification_handler(self, sender, data):
-        """Simple notification handler which accumulates data."""
-        self.notification_data.extend(data)
-        # A simple heuristic to determine if a full message has been received:
-        # Check for start (0x7a) and end (0xa7) sentinels.
-        # This might need refinement based on actual message patterns.
-        if self.notification_data.startswith(b'\x7a') and self.notification_data.endswith(b'\xa7'):
-            self.notification_event.set() # Signal that a potential full message is ready 
+    def on_disconnect(self, client: BleakClient):
+        self._LOGGER.warning(f"Disconnected from {self.mac_address}")
+        self._is_connected = False
 
     async def connect(self):
         self._LOGGER.info(f"Searching for device {self.mac_address}...")
@@ -236,101 +232,110 @@ class VestwoodsBMSClient:
 
         self._LOGGER.info(f"Found device: {device.name} ({device.address})")
 
-        self.client = BleakClient(device)
-        try:
-            await self.client.connect()
-            if self.client.is_connected:
-                self._LOGGER.info(f"Connected to {device.name} ({device.address})")
-                return True
-            else:
-                self._LOGGER.warning(f"Failed to connect to {device.address}")
-                return False
-        except BleakError as e:
-            self._LOGGER.error(f"Bleak error on connect: {e}")
-            return False
+        self.client = await establish_connection(
+            BleakClient,
+            device,
+            name=self.mac_address,
+            disconnected_callback=self.on_disconnect,
+        )
+        self._is_connected = self.client.is_connected
+        if self._is_connected:
+            self._LOGGER.info(f"Connected to {device.name} ({device.address})")
+        return self._is_connected
 
     async def disconnect(self):
-        if self.client and self.client.is_connected:
+        if self.client and self._is_connected:
             await self.client.disconnect()
+            self._is_connected = False
             self._LOGGER.info(f"Disconnected from {self.mac_address}")
 
+    def _notification_handler(self, sender, data):
+        """Accumulates data from notifications."""
+        self.notification_data.extend(data)
+
     async def read_and_publish_data(self):
-        if not self.client or not self.client.is_connected:
+        if not self.client or not self._is_connected:
             self._LOGGER.warning("Not connected to BMS. Skipping data read.")
             return
 
         try:
-            # Enable notifications on the correct RX characteristic
             await self.client.start_notify(RX_CHAR_UUID, self._notification_handler)
-            self._LOGGER.debug(f"Enabled notifications on {RX_CHAR_UUID}")
-            notifications_enabled = True
-        except BleakError as e:
-            self._LOGGER.error(f"Could not enable notifications on {RX_CHAR_UUID}: {e}")
-            notifications_enabled = False
-            self._LOGGER.warning("Cannot proceed without notifications on the RX characteristic.")
-            return # Exit if notifications cannot be enabled
-
-        # Send the polling command to the correct TX characteristic
-        self._LOGGER.debug(f"Sending poll command: {POLL_COMMAND.hex()} to {TX_CHAR_UUID}")
-        await self.client.write_gatt_char(TX_CHAR_UUID, POLL_COMMAND, response=False)
-        self._LOGGER.debug("Poll command sent.")
-
-        if notifications_enabled:
-            self._LOGGER.debug("Waiting for response via notifications...")
-            try:
-                await asyncio.wait_for(self.notification_event.wait(), timeout=10.0)
-            except asyncio.TimeoutError:
-                self._LOGGER.warning("Timeout waiting for BMS response via notifications.")
-        
-        if self.notification_data:
-            self._LOGGER.debug(f"Received raw data: {self.notification_data.hex()}")
-            parsed_data = parse_response(self.notification_data)
-            if parsed_data:
-                self._LOGGER.info("--- Parsed BMS Data ---")
-                for key, value in parsed_data.items():
-                    if key == 'cellVoltages':
-                        for i, voltage in enumerate(value):
-                            topic = f"{self.mqtt_topic_prefix}/cellVoltage_{i+1}"
-                            await mqtt.async_publish(self.hass, topic, json.dumps(voltage), qos=0, retain=False)
-                    elif key == 'cellTemperatures':
-                        for i, temp in enumerate(value):
-                            topic = f"{self.mqtt_topic_prefix}/cellTemperature_{i+1}"
-                            await mqtt.async_publish(self.hass, topic, json.dumps(temp), qos=0, retain=False)
-                    else:
-                        topic = f"{self.mqtt_topic_prefix}/{key}"
-                        await mqtt.async_publish(self.hass, topic, json.dumps(value), qos=0, retain=False)
-            else:
-                self._LOGGER.warning("Failed to parse BMS data.")
-            self.notification_data = bytearray() # Clear for next reading
-            self.notification_event.clear() # Clear event for next reading
-        else:
-            self._LOGGER.warning("No data received from BMS after all attempts.")
-
-        if notifications_enabled:
+            await self.client.write_gatt_char(TX_CHAR_UUID, POLL_COMMAND, response=False)
+            await asyncio.sleep(2)  # Wait for notifications
             await self.client.stop_notify(RX_CHAR_UUID)
-            self._LOGGER.debug("Notifications stopped.")
+
+            while self.notification_data:
+                start_index = self.notification_data.find(b'\x7a')
+                if start_index == -1:
+                    self._LOGGER.debug("No start sentinel found in buffer. Discarding.")
+                    self.notification_data.clear()
+                    break
+
+                if start_index > 0:
+                    self._LOGGER.debug(f"Discarding {start_index} bytes before start sentinel.")
+                    self.notification_data = self.notification_data[start_index:]
+
+                if len(self.notification_data) < 4:
+                    self._LOGGER.debug("Buffer too small for header. Waiting for more data.")
+                    break
+
+                payload_len = self.notification_data[2]
+                total_len = payload_len + 4
+
+                if len(self.notification_data) < total_len:
+                    self._LOGGER.debug(f"Incomplete message. Got {len(self.notification_data)}, expected {total_len}. Waiting for more data.")
+                    break
+
+                message = self.notification_data[:total_len]
+                
+                if not message.endswith(b'\xa7'):
+                    self._LOGGER.warning("Message does not end with sentinel. Discarding.")
+                    self.notification_data = self.notification_data[1:] # Discard the 0x7a and retry
+                    continue
+
+                parsed_data = parse_response(message)
+                if parsed_data:
+                    self._LOGGER.info("--- Parsed BMS Data ---")
+                    for key, value in parsed_data.items():
+                        if key == 'cellVoltages':
+                            for i, voltage in enumerate(value):
+                                topic = f"{self.mqtt_topic_prefix}/cellVoltage_{i+1}"
+                                await mqtt.async_publish(self.hass, topic, json.dumps(voltage), qos=0, retain=False)
+                        elif key == 'cellTemperatures':
+                            for i, temp in enumerate(value):
+                                topic = f"{self.mqtt_topic_prefix}/cellTemperature_{i+1}"
+                                await mqtt.async_publish(self.hass, topic, json.dumps(temp), qos=0, retain=False)
+                        else:
+                            topic = f"{self.mqtt_topic_prefix}/{key}"
+                            await mqtt.async_publish(self.hass, topic, json.dumps(value), qos=0, retain=False)
+                else:
+                    self._LOGGER.warning("Failed to parse BMS data.")
+                
+                self.notification_data = self.notification_data[total_len:]
+
+        except BleakError as e:
+            self._LOGGER.error(f"BLE error during read: {e}")
+            await self.disconnect()
 
     async def run(self, refresh_interval: int = 30):
         while True:
             try:
-                if not self.client or not self.client.is_connected:
+                if not self._is_connected:
                     self._LOGGER.info("Attempting to connect to BMS...")
-                    if await self.connect():
-                        self._LOGGER.info("Successfully connected to BMS.")
-                    else:
-                        self._LOGGER.error("Failed to connect to BMS. Retrying in 5 seconds...")
-                        await asyncio.sleep(5)
+                    if not await self.connect():
+                        self._LOGGER.error("Failed to connect to BMS. Retrying in 60 seconds...")
+                        await asyncio.sleep(60)
                         continue
 
                 await self.read_and_publish_data()
 
             except BleakError as e:
-                self._LOGGER.error(f"BLE error during run: {e}. Attempting to reconnect in 5 seconds...")
+                self._LOGGER.error(f"BLE error during run: {e}. Attempting to reconnect in 60 seconds...")
                 await self.disconnect()
-                await asyncio.sleep(5)
+                await asyncio.sleep(60)
             except Exception as e:
-                self._LOGGER.error(f"An unexpected error occurred: {e}. Retrying in 5 seconds...")
+                self._LOGGER.error(f"An unexpected error occurred: {e}. Retrying in 60 seconds...")
                 await self.disconnect()
-                await asyncio.sleep(5)
+                await asyncio.sleep(60)
             finally:
                 await asyncio.sleep(refresh_interval)
